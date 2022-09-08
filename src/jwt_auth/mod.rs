@@ -56,7 +56,7 @@ impl JwtAuth {
     }
 }
 
-const X_UID: &str = "X_UID";
+const X_UID: &str = "X-Uid";
 const CLAIMS_KEY: &str = "claims";
 
 #[async_trait]
