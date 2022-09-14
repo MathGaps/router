@@ -85,6 +85,7 @@ impl Plugin for JwtAuth {
     fn subgraph_service(&self, _name: &str, service: subgraph::BoxService) -> subgraph::BoxService {
         ServiceBuilder::new()
             .map_request(|mut req: subgraph::Request| {
+                req.subgraph_request.headers_mut().remove(X_UID);
                 if let Ok(Some(claims)) = req.context.get::<_, Claims>(CLAIMS_KEY) {
                     let header_value =
                         HeaderValue::from_str(&claims.sub).expect("id must be ASCII");
