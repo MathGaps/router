@@ -115,7 +115,7 @@ impl Plugin for JwtAuth {
         ServiceBuilder::new()
             .map_request(move |req: supergraph::Request| {
                 // Check if all operations in the request are public
-                if let Some(query) = &req.originating_request.body().query {
+                if let Some(query) = &req.supergraph_request.body().query {
                     if public_validator.validate(query.to_string()) {
                         println!("validated!");
                         if let Err(e) = req.context.insert(VALID_PUBLIC_KEY, true) {
@@ -148,10 +148,7 @@ impl Plugin for JwtAuth {
                         status: StatusCode,
                     ) -> supergraph::Response {
                         supergraph::Response::error_builder()
-                            .errors(vec![graphql::Error {
-                                message: msg,
-                                ..Default::default()
-                            }])
+                            .error(graphql::Error::builder().message(msg).build())
                             .status_code(status)
                             .context(context)
                             .build()
@@ -160,26 +157,26 @@ impl Plugin for JwtAuth {
 
                     // We are implementing: https://www.rfc-editor.org/rfc/rfc6750
                     // so check for our AUTHORIZATION header.
-                    let jwt_value_result =
-                        match req.originating_request.headers().get(AUTHORIZATION) {
-                            Some(value) => Some(value.to_str()),
-                            None =>
-                            // If the request is public, allow skipping JWT validation
-                            // Otherwise, prepare an HTTP 401 response with a GraphQL error message
-                            {
-                                if is_public_request {
-                                    println!("apparently returning");
-                                    return Ok(ControlFlow::Continue(req));
-                                }
-
-                                failure = Some(failure_message(
-                                    req.context.clone(),
-                                    format!("Missing '{}' header", AUTHORIZATION),
-                                    StatusCode::UNAUTHORIZED,
-                                ));
-                                None
+                    let jwt_value_result = match req.supergraph_request.headers().get(AUTHORIZATION)
+                    {
+                        Some(value) => Some(value.to_str()),
+                        None =>
+                        // If the request is public, allow skipping JWT validation
+                        // Otherwise, prepare an HTTP 401 response with a GraphQL error message
+                        {
+                            if is_public_request {
+                                println!("apparently returning");
+                                return Ok(ControlFlow::Continue(req));
                             }
-                        };
+
+                            failure = Some(failure_message(
+                                req.context.clone(),
+                                format!("Missing '{}' header", AUTHORIZATION),
+                                StatusCode::UNAUTHORIZED,
+                            ));
+                            None
+                        }
+                    };
 
                     // If we find the header, but can't convert it to a string, let the client know
                     let jwt_value = match jwt_value_result {
@@ -363,7 +360,7 @@ mod tests {
             .expect_call()
             .once()
             .returning(move |req: supergraph::Request| {
-                let id = req.originating_request.headers().get(X_UID);
+                let id = req.supergraph_request.headers().get(X_UID);
                 assert!(id.is_none());
                 supergraph::Response::fake_builder()
                     .status_code(StatusCode::OK)

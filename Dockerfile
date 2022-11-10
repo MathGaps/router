@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 rust:1.63 as build
+FROM --platform=linux/amd64 rust:1.65 as build
 
 ENV NODE_VERSION=16.13.0
 RUN apt install -y curl
@@ -33,7 +33,7 @@ COPY ./src ./src
 
 # build for release
 RUN rm ./target/release/deps/router*
-RUN cargo build --release
+RUN cargo build --release --verbose
 
 RUN mkdir -p /dist/config && mkdir -p /dist/schema
 
