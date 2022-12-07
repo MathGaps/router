@@ -1,11 +1,12 @@
 FROM --platform=linux/amd64 rust:1.65 as build
 
 ENV RUST_BACKTRACE=full
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 # create a new empty shell project
-RUN USER=root cargo new --bin acme_router
+RUN USER=root cargo new --bin router
 
-WORKDIR /acme_router
+WORKDIR /router
 
 RUN rustup component add rustfmt
 
@@ -20,7 +21,7 @@ RUN rm src/*.rs
 COPY ./src ./src
 
 # build for release
-RUN rm ./target/release/deps/acme_router*
+RUN rm ./target/release/deps/router*
 RUN cargo build --release --verbose
 
 RUN mkdir -p /dist/config && mkdir -p /dist/schema
@@ -32,13 +33,13 @@ RUN mkdir -p /dist/config && mkdir -p /dist/schema
 FROM --platform=linux/amd64 debian:bullseye
 
 RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    curl
+  ca-certificates \
+  curl
 
 # copy the build artifact from the build stage
 COPY --from=build /dist /dist
-COPY --from=build --chown=root:root /acme_router/target/release/acme_router /dist
-COPY --from=build --chown=root:root /acme_router/Cargo.lock /dist
+COPY --from=build --chown=root:root /router/target/release/router /dist
+COPY --from=build --chown=root:root /router/Cargo.lock /dist
 
 WORKDIR /dist
 
@@ -47,4 +48,4 @@ STOPSIGNAL SIGINT
 
 # set the startup command to run your binary
 # note: if you want sh you can override the entrypoint using docker run -it --entrypoint=sh my-router-image
-ENTRYPOINT ["./acme_router"]
+ENTRYPOINT ["./router"]

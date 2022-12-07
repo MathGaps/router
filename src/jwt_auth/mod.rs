@@ -7,10 +7,13 @@ use apollo_router::plugin::{Plugin, PluginInit};
 use apollo_router::services::{subgraph, supergraph};
 use apollo_router::{graphql, register_plugin, Context};
 use async_trait::async_trait;
-use http::header::AUTHORIZATION;
+use cookie::time::Duration as CookieDuration;
+use cookie::Cookie;
+use http::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
 use http::{HeaderValue, StatusCode};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::Mutex;
 use tower::{BoxError, ServiceBuilder, ServiceExt};
 
@@ -25,6 +28,9 @@ mod verifier;
 
 #[derive(Debug, Default, Deserialize, JsonSchema, Clone)]
 pub(crate) struct JwkConfiguration {
+    pub(crate) host: String,
+    pub(crate) oso_cloud_token: String,
+
     pub(crate) jwk_url: String,
     pub(crate) audience: String,
     pub(crate) issuer: String,
@@ -59,8 +65,13 @@ impl JwtAuth {
     }
 }
 
-const X_UID: &str = "X-Uid";
+const X_UID_HEADER: &str = "X-Uid";
+const X_IMPERSONATING_UID_HEADER: &str = "X-Impersonating-Uid";
+const SESSION_REFRESH_COOKIE: &str = "router_session_refresh";
+const OSO_CLOUD_API: &str = "https://cloud.osohq.com/api/";
+const JWT_KEY: &str = "jwt";
 const CLAIMS_KEY: &str = "claims";
+const IMPERSONATING_UID_KEY: &str = "impersonating_uid";
 const VALID_PUBLIC_KEY: &str = "public";
 
 #[async_trait]
@@ -88,13 +99,20 @@ impl Plugin for JwtAuth {
     fn subgraph_service(&self, _name: &str, service: subgraph::BoxService) -> subgraph::BoxService {
         ServiceBuilder::new()
             .map_request(|mut req: subgraph::Request| {
-                req.subgraph_request.headers_mut().remove(X_UID);
+                let headers = req.subgraph_request.headers_mut();
+                headers.remove(X_UID_HEADER);
+                headers.remove(X_IMPERSONATING_UID_HEADER);
+
                 if let Ok(Some(claims)) = req.context.get::<_, Claims>(CLAIMS_KEY) {
                     let header_value =
                         HeaderValue::from_str(&claims.sub).expect("id must be ASCII");
-                    req.subgraph_request
-                        .headers_mut()
-                        .insert(X_UID, header_value);
+                    headers.insert(X_UID_HEADER, header_value);
+                }
+                if let Ok(Some(impersonating)) = req.context.get::<_, String>(IMPERSONATING_UID_KEY)
+                {
+                    let header_value = HeaderValue::from_str(&impersonating)
+                        .expect("impersonating id must be ASCII");
+                    headers.insert(X_IMPERSONATING_UID_HEADER, header_value);
                 }
                 req
             })
@@ -107,6 +125,7 @@ impl Plugin for JwtAuth {
         let config_ref = Arc::new(self.config.clone());
         let jwk_ref = self.jwk_cache.clone();
         let public_validator = self.public_validator.clone();
+        let host = config_ref.host.clone();
 
         // `ServiceBuilder` provides us with an `checkpoint` method.
         //
@@ -117,10 +136,9 @@ impl Plugin for JwtAuth {
                 // Check if all operations in the request are public
                 if let Some(query) = &req.supergraph_request.body().query {
                     if public_validator.validate(query.to_string()) {
-                        println!("validated!");
                         if let Err(e) = req.context.insert(VALID_PUBLIC_KEY, true) {
                             println!(
-                                "encountered error inserting VALID_PUBLIC_KEY into context: {:?}",
+                                "Encountered error inserting VALID_PUBLIC_KEY into context: {:?}",
                                 e
                             )
                         }
@@ -137,7 +155,6 @@ impl Plugin for JwtAuth {
                     .get::<_, bool>(VALID_PUBLIC_KEY)
                     .unwrap_or(None)
                     .unwrap_or(false);
-                println!("is public req: {:?}", is_public_request);
 
                 async move {
                     let mut failure = None;
@@ -165,7 +182,6 @@ impl Plugin for JwtAuth {
                         // Otherwise, prepare an HTTP 401 response with a GraphQL error message
                         {
                             if is_public_request {
-                                println!("apparently returning");
                                 return Ok(ControlFlow::Continue(req));
                             }
 
@@ -219,6 +235,9 @@ impl Plugin for JwtAuth {
                     // Trim off any trailing white space (not valid in BASE64 encoding)
                     let jwt_opt = jwt_parts.map(|v| v[1].trim_end());
                     let jwt = jwt_opt.unwrap();
+                    if let Err(e) = req.context.insert(JWT_KEY, jwt.to_string()) {
+                        println!("error inserting JWT_KEY into context: {}", e);
+                    }
 
                     // Validate our token
                     let guard = jwk_ref.lock().await;
@@ -229,9 +248,11 @@ impl Plugin for JwtAuth {
                     let config = config_ref.clone();
                     let verifier = JwkVerifier::new(
                         JwkConfiguration {
+                            host: config.host.clone(),
                             jwk_url: config.jwk_url.clone(),
                             audience: config.audience.clone(),
                             issuer: config.issuer.clone(),
+                            oso_cloud_token: config.oso_cloud_token.clone(),
                         },
                         keys,
                     );
@@ -245,14 +266,177 @@ impl Plugin for JwtAuth {
                             )));
                         }
                     };
+                    let authorized_uid = token_data.claims.sub.clone();
 
                     match req.context.insert(CLAIMS_KEY, token_data.claims) {
-                        Ok(_) => Ok(ControlFlow::Continue(req)),
-                        Err(err) => Ok(ControlFlow::Break(failure_message(
-                            req.context,
-                            format!("couldn't store JWT claims in context: {}", err),
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                        ))),
+                        Ok(_) => {}
+                        Err(err) => {
+                            return Ok(ControlFlow::Break(failure_message(
+                                req.context,
+                                format!("couldn't store JWT claims in context: {}", err),
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            )))
+                        }
+                    };
+
+                    // Verify authorized user can impersonate
+                    let impersonating_uid = match req
+                        .supergraph_request
+                        .headers()
+                        .get(X_IMPERSONATING_UID_HEADER)
+                        .map(|h| h.to_str())
+                    {
+                        Some(Ok(impersonating)) => impersonating.to_owned(),
+                        Some(Err(err)) => {
+                            return Ok(ControlFlow::Break(failure_message(
+                                req.context,
+                                format!(
+                                    "error converting impersonating uid header to string: {}",
+                                    err
+                                ),
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            )))
+                        }
+                        None => return Ok(ControlFlow::Continue(req)),
+                    };
+                    if impersonating_uid == authorized_uid {
+                        return Ok(ControlFlow::Continue(req));
+                    }
+                    match req
+                        .context
+                        .insert(IMPERSONATING_UID_KEY, impersonating_uid.clone())
+                    {
+                        Ok(_) => {}
+                        Err(err) => {
+                            return Ok(ControlFlow::Break(failure_message(
+                                req.context,
+                                format!("couldn't store impersonating uid in context: {}", err),
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            )))
+                        }
+                    };
+                    let oso_cloud_token = config.oso_cloud_token.clone();
+
+                    let body = json!({
+                        "fact": {
+                            "predicate": "can_impersonate",
+                            "args": [
+                                {
+                                    "type": "User",
+                                    "id": authorized_uid,
+                                },
+                                {
+                                    "type": "User",
+                                    "id": impersonating_uid,
+                                },
+                            ]
+                        }
+                    });
+                    let res = match reqwest::Client::new()
+                        .post(format!("{}/query", OSO_CLOUD_API))
+                        .json(&body)
+                        .bearer_auth(oso_cloud_token)
+                        .send()
+                        .await
+                    {
+                        Ok(res) => res,
+                        Err(err) => {
+                            return Ok(ControlFlow::Break(failure_message(
+                                req.context,
+                                format!("query request to oso-cloud failed: {}", err),
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            )))
+                        }
+                    };
+                    let payload = match res.json::<serde_json::Value>().await {
+                        Ok(payload) => payload,
+                        Err(err) => {
+                            return Ok(ControlFlow::Break(failure_message(
+                                req.context,
+                                format!("could not deserialize oso-cloud response: {}", err),
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            )))
+                        }
+                    };
+                    match payload.get("results") {
+                        Some(serde_json::Value::Array(results)) => {
+                            if results.is_empty() {
+                                Ok(ControlFlow::Break(failure_message(
+                                    req.context,
+                                    format!(
+                                        "user {} is not authorized to impersonate user {}",
+                                        authorized_uid, impersonating_uid
+                                    ),
+                                    StatusCode::UNAUTHORIZED,
+                                )))
+                            } else {
+                                Ok(ControlFlow::Continue(req))
+                            }
+                        }
+                        _ => {
+                            return Ok(ControlFlow::Break(failure_message(
+                                req.context,
+                                format!("could not extract results from payload: {}", payload),
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            )))
+                        }
+                    }
+                }
+            })
+            .map_request(move |mut req: supergraph::Request| {
+                // Refresh the session cookie if required
+                let raw_cookies = match req
+                    .supergraph_request
+                    .headers()
+                    .get(COOKIE)
+                    .map(|cookie_header| cookie_header.to_str())
+                {
+                    Some(Ok(cookies)) => cookies,
+                    _ => return req,
+                };
+
+                match raw_cookies.split("; ").find(|&c| match c.split_once('=') {
+                    Some((k, _)) => k == SESSION_REFRESH_COOKIE,
+                    _ => false,
+                }) {
+                    Some(_) => req,
+                    _ => {
+                        let jwt = match req.context.get::<_, String>(JWT_KEY) {
+                            Ok(Some(jwt)) => jwt,
+                            _ => return req,
+                        };
+                        let thread_host = host.clone();
+                        tokio::spawn(async move {
+                            let client = reqwest::Client::new();
+                            if let Ok(req) = client
+                                .post(format!("{}/accounts/login", thread_host))
+                                .bearer_auth(jwt)
+                                .build()
+                            {
+                                if let Err(e) = client.execute(req).await {
+                                    println!(
+                                        "error while executing request at accounts/login: {}",
+                                        e
+                                    )
+                                }
+                            }
+                        });
+                        let refresh_cookie = Cookie::build(SESSION_REFRESH_COOKIE, "1")
+                            .domain(host.clone())
+                            .secure(true)
+                            .http_only(true)
+                            .same_site(cookie::SameSite::Strict)
+                            .max_age(CookieDuration::minutes(15))
+                            .finish();
+                        let header_value = match HeaderValue::from_str(&refresh_cookie.to_string())
+                        {
+                            Ok(hv) => hv,
+                            _ => return req,
+                        };
+                        req.supergraph_request
+                            .headers_mut()
+                            .insert(SET_COOKIE, header_value);
+                        req
                     }
                 }
             })
@@ -277,6 +461,7 @@ mod tests {
         let config = serde_json::json!({
             "plugins": {
                 "auth.jwt": {
+                    "host": "tuterodev.com.au",
                     "jwk_url": "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com",
                     "audience": "",
                     "issuer": "",
@@ -294,9 +479,11 @@ mod tests {
     #[tokio::test]
     async fn key_is_initialized() {
         let config = JwkConfiguration {
+            host: "tuterodev.com".to_string(),
             jwk_url: "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com".to_string(),
             audience: "".to_string(),
             issuer: "".to_string(),
+            oso_cloud_token: "".to_string(),
         };
         let jwt_auth = JwtAuth::new(PluginInit::new(config, Default::default()))
             .await
@@ -308,9 +495,11 @@ mod tests {
     #[tokio::test]
     async fn key_is_refreshed() {
         let config = JwkConfiguration {
+            host: "tuterodev.com".to_string(),
             jwk_url: "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com".to_string(),
             audience: "".to_string(),
             issuer: "".to_string(),
+            oso_cloud_token: "".to_string(),
         };
         let jwt_auth = JwtAuth::new(PluginInit::new(config, Default::default()))
             .await
@@ -335,12 +524,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_refresh_cookie_created() {
+        //     let mut mock_svc = test::MockSupergraphService::new();
+        //     mock_svc
+        //         .expect_call()
+        //         .once()
+        //         .returning(move |req: supergraph::Request| {
+        //             let src = req
+        //                 .supergraph_request
+        //                 .headers()
+        //                 .get(SESSION_REFRESH_COOKIE)
+        //                 .expect("should have session refresh header");
+        //             assert_eq!(src.to_str().unwrap(), "1");
+        //             supergraph::Response::fake_builder()
+        //                 .status_code(StatusCode::OK)
+        //                 .build()
+        //         });
+        //     let config = JwkConfiguration {
+        //         host: "tuterodev.com".to_string(),
+        //         jwk_url: "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com".to_string(),
+        //         audience: "".to_string(),
+        //         issuer: "".to_string(),
+        //     };
+        //     let svc_stack = JwtAuth::new(PluginInit::new(config, Default::default()))
+        //         .await
+        //         .expect("initializes")
+        //         .supergraph_service(mock_svc.boxed());
+        //     let mock_req = supergraph::Request::fake_builder()
+        //         .header(AUTHORIZATION, "Bearer yrdya")
+        //         .build()
+        //         .expect("expecting valid request");
+        //     let res = svc_stack.oneshot(mock_req).await.unwrap();
+        //     assert_eq!(res.response.status(), StatusCode::OK);
+        todo!("Issue a token so that this test can be finished");
+    }
+
+    #[tokio::test]
     async fn no_authorization_header() {
         let mock_svc = test::MockSupergraphService::new();
         let config = JwkConfiguration {
+            host: "tuterodev.com".to_string(),
             jwk_url: "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com".to_string(),
             audience: "".to_string(),
             issuer: "".to_string(),
+            oso_cloud_token: "".to_string(),
         };
         let svc_stack = JwtAuth::new(PluginInit::new(config, Default::default()))
             .await
@@ -360,16 +587,18 @@ mod tests {
             .expect_call()
             .once()
             .returning(move |req: supergraph::Request| {
-                let id = req.supergraph_request.headers().get(X_UID);
+                let id = req.supergraph_request.headers().get(X_UID_HEADER);
                 assert!(id.is_none());
                 supergraph::Response::fake_builder()
                     .status_code(StatusCode::OK)
                     .build()
             });
         let config = JwkConfiguration {
+            host: "tuterodev.com".to_string(),
             jwk_url: "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com".to_string(),
             audience: "".to_string(),
             issuer: "".to_string(),
+            oso_cloud_token: "".to_string(),
         };
         let svc_stack = JwtAuth::new(PluginInit::new(
             config,
@@ -415,9 +644,11 @@ mutation {
     async fn should_have_bearer() {
         let mock_svc = test::MockSupergraphService::new();
         let config = JwkConfiguration {
+            host: "tuterodev.com".to_string(),
             jwk_url: "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com".to_string(),
             audience: "".to_string(),
             issuer: "".to_string(),
+            oso_cloud_token: "".to_string(),
         };
         let svc_stack = JwtAuth::new(PluginInit::new(config, Default::default()))
             .await
@@ -435,9 +666,11 @@ mutation {
     async fn should_have_bearer_value() {
         let mock_svc = test::MockSupergraphService::new();
         let config = JwkConfiguration {
+            host: "tuterodev.com".to_string(),
             jwk_url: "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com".to_string(),
             audience: "".to_string(),
             issuer: "".to_string(),
+            oso_cloud_token: "".to_string(),
         };
         let svc_stack = JwtAuth::new(PluginInit::new(config, Default::default()))
             .await
@@ -462,7 +695,7 @@ mutation {
                 let id = req
                     .subgraph_request
                     .headers()
-                    .get(X_UID)
+                    .get(X_UID_HEADER)
                     .expect("should have UID header");
                 assert_eq!(id.to_str().unwrap(), expected_id);
                 Ok(subgraph::Response::fake_builder()
@@ -470,9 +703,11 @@ mutation {
                     .build())
             });
         let config = JwkConfiguration {
+            host: "tuterodev.com".to_string(),
             jwk_url: "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com".to_string(),
             audience: "".to_string(),
             issuer: "".to_string(),
+            oso_cloud_token: "".to_string(),
         };
         let svc_stack = JwtAuth::new(PluginInit::new(config, Default::default()))
             .await

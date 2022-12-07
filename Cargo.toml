@@ -10,6 +10,7 @@ anyhow = "1"
 apollo-parser = "0.2.10"
 apollo-router = { git = "https://github.com/apollographql/router", tag = "v1.3.0" }
 async-trait = "0.1"
+cookie = "0.16"
 futures = "0.3"
 hex = "0.4"
 http = "0.2"
@@ -17,7 +18,7 @@ jsonwebkey = { version = "0.3.5", features = ["jwt-convert"] }
 jsonwebtoken = "8.1.1"
 jwt-simple = "0.11"
 openssl = "0.10.41"
-reqwest = "0.11.11"
+reqwest = { version= "0.11.11", features = ["json"] }
 schemars = { version = "0.8", features = ["url"] }
 serde = "1"
 serde_json = "1"

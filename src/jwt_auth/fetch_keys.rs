@@ -31,6 +31,8 @@ pub(crate) async fn fetch_keys(config: &JwkConfiguration) -> Result<JsonWebKeys>
 #[tokio::test]
 async fn fetches_keys_from_firebase_jwk() {
     let config = JwkConfiguration{
+        oso_cloud_token: "".to_string(),
+        host: "tuterodev.com.au".to_string(),
         jwk_url: "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com".to_string(),
         audience: "my-firebase-app-12345".to_string(),
         issuer: "https://securetoken.google.com/my-firebase-app-12345".to_string(),
