@@ -52,7 +52,11 @@ struct ImpersonationCache(moka::sync::Cache<Impersonation, bool>);
 
 impl Default for ImpersonationCache {
     fn default() -> Self {
-        Self(moka::sync::Cache::new(1000))
+        Self(
+            moka::sync::CacheBuilder::new(1000)
+                .time_to_live(Duration::from_secs(60 * 10))
+                .build(),
+        )
     }
 }
 
@@ -296,10 +300,11 @@ impl Plugin for JwtAuth {
 
                     // Check if authorization request has been cached
                     let cache = impersonation_cache.clone();
-                    match cache.get(&Impersonation {
+                    let impersonation = Impersonation {
                         impersonator: authorized_uid.clone(),
                         student: impersonating_uid.clone(),
-                    }) {
+                    };
+                    match cache.get(&impersonation) {
                         Some(true) => return Ok(ControlFlow::Continue(req)),
                         Some(false) => {
                             return Ok(ControlFlow::Break(failure_message(
@@ -359,6 +364,7 @@ impl Plugin for JwtAuth {
                     match payload.get("results") {
                         Some(serde_json::Value::Array(results)) => {
                             if results.is_empty() {
+                                cache.insert(impersonation, false);
                                 Ok(ControlFlow::Break(failure_message(
                                     req.context,
                                     format!(
@@ -368,6 +374,7 @@ impl Plugin for JwtAuth {
                                     StatusCode::UNAUTHORIZED,
                                 )))
                             } else {
+                                cache.insert(impersonation, true);
                                 Ok(ControlFlow::Continue(req))
                             }
                         }
