@@ -18,12 +18,10 @@ use tokio::sync::Mutex;
 use tower::{BoxError, ServiceBuilder, ServiceExt};
 
 use self::fetch_keys::{fetch_keys, JsonWebKeys};
-use self::public_operations::PublicOperationsValidator;
 use self::verifier::{Claims, JwkVerifier};
 
 mod fetch_keys;
 mod get_max_age;
-mod public_operations;
 mod verifier;
 
 #[derive(Debug, Default, Deserialize, JsonSchema, Clone)]
@@ -40,7 +38,22 @@ pub(crate) struct JwkConfiguration {
 struct JwtAuth {
     config: JwkConfiguration,
     jwk_cache: Arc<Mutex<Option<JsonWebKeys>>>,
-    public_validator: PublicOperationsValidator,
+    impersonation_cache: ImpersonationCache,
+}
+
+#[derive(Clone, Default, Eq, Hash, PartialEq)]
+struct Impersonation {
+    impersonator: String,
+    student: String,
+}
+
+#[derive(Clone)]
+struct ImpersonationCache(moka::sync::Cache<Impersonation, bool>);
+
+impl Default for ImpersonationCache {
+    fn default() -> Self {
+        Self(moka::sync::Cache::new(1000))
+    }
 }
 
 impl JwtAuth {
@@ -72,7 +85,6 @@ const OSO_CLOUD_API: &str = "https://cloud.osohq.com/api/";
 const JWT_KEY: &str = "jwt";
 const CLAIMS_KEY: &str = "claims";
 const IMPERSONATING_UID_KEY: &str = "impersonating_uid";
-const VALID_PUBLIC_KEY: &str = "public";
 
 #[async_trait]
 impl Plugin for JwtAuth {
@@ -80,7 +92,6 @@ impl Plugin for JwtAuth {
 
     async fn new(init: PluginInit<Self::Config>) -> Result<Self, BoxError> {
         let config = init.config;
-        let supergraph_sdl = init.supergraph_sdl.clone();
         let jwk_keys: JsonWebKeys = match fetch_keys(&config).await {
             Ok(keys) => keys,
             Err(_) => {
@@ -90,7 +101,7 @@ impl Plugin for JwtAuth {
         let mut instance = JwtAuth {
             config,
             jwk_cache: Arc::new(Mutex::new(Some(jwk_keys))),
-            public_validator: PublicOperationsValidator::new(supergraph_sdl.to_string()),
+            impersonation_cache: Default::default(),
         };
         instance.start_key_update();
         Ok(instance)
@@ -124,37 +135,18 @@ impl Plugin for JwtAuth {
         // Clone/Copy the data we need in our closure.
         let config_ref = Arc::new(self.config.clone());
         let jwk_ref = self.jwk_cache.clone();
-        let public_validator = self.public_validator.clone();
         let host = config_ref.host.clone();
+        let impersonation_cache = self.impersonation_cache.clone();
 
         // `ServiceBuilder` provides us with an `checkpoint` method.
         //
         // This method allows us to return ControlFlow::Continue(request) if we want to let the request through,
         // or ControlFlow::Break(response) with a crafted response if we don't want the request to go through.
         ServiceBuilder::new()
-            .map_request(move |req: supergraph::Request| {
-                // Check if all operations in the request are public
-                if let Some(query) = &req.supergraph_request.body().query {
-                    if public_validator.validate(query.to_string()) {
-                        if let Err(e) = req.context.insert(VALID_PUBLIC_KEY, true) {
-                            println!(
-                                "Encountered error inserting VALID_PUBLIC_KEY into context: {:?}",
-                                e
-                            )
-                        }
-                    }
-                }
-                req
-            })
             .checkpoint_async(move |req: supergraph::Request| {
                 let config_ref = config_ref.clone();
                 let jwk_ref = jwk_ref.clone();
-
-                let is_public_request = req
-                    .context
-                    .get::<_, bool>(VALID_PUBLIC_KEY)
-                    .unwrap_or(None)
-                    .unwrap_or(false);
+                let impersonation_cache = impersonation_cache.0.clone();
 
                 async move {
                     let mut failure = None;
@@ -177,21 +169,7 @@ impl Plugin for JwtAuth {
                     let jwt_value_result = match req.supergraph_request.headers().get(AUTHORIZATION)
                     {
                         Some(value) => Some(value.to_str()),
-                        None =>
-                        // If the request is public, allow skipping JWT validation
-                        // Otherwise, prepare an HTTP 401 response with a GraphQL error message
-                        {
-                            if is_public_request {
-                                return Ok(ControlFlow::Continue(req));
-                            }
-
-                            failure = Some(failure_message(
-                                req.context.clone(),
-                                format!("Missing '{}' header", AUTHORIZATION),
-                                StatusCode::UNAUTHORIZED,
-                            ));
-                            None
-                        }
+                        None => return Ok(ControlFlow::Continue(req)),
                     };
 
                     // If we find the header, but can't convert it to a string, let the client know
@@ -315,8 +293,28 @@ impl Plugin for JwtAuth {
                             )))
                         }
                     };
-                    let oso_cloud_token = config.oso_cloud_token.clone();
 
+                    // Check if authorization request has been cached
+                    let cache = impersonation_cache.clone();
+                    match cache.get(&Impersonation {
+                        impersonator: authorized_uid.clone(),
+                        student: impersonating_uid.clone(),
+                    }) {
+                        Some(true) => return Ok(ControlFlow::Continue(req)),
+                        Some(false) => {
+                            return Ok(ControlFlow::Break(failure_message(
+                                req.context,
+                                format!(
+                                    "user {} is not authorized to impersonate user {}",
+                                    authorized_uid, impersonating_uid
+                                ),
+                                StatusCode::UNAUTHORIZED,
+                            )))
+                        }
+                        None => {}
+                    }
+
+                    let oso_cloud_token = config.oso_cloud_token.clone();
                     let body = json!({
                         "fact": {
                             "predicate": "can_impersonate",
