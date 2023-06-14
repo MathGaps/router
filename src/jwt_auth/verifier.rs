@@ -34,10 +34,10 @@ pub(crate) struct JwkVerifier {
 #[derive(Default, Debug, Serialize, Deserialize)]
 pub(crate) struct Claims {
     pub(crate) sub: String, // Subject (UID)
-    exp: usize,      // Expiration time (as UTC timestamp)
-    aud: String,     // Audience
-    iat: usize,      // Issued at (as UTC timestamp)
-    iss: String,     // Issuer
+    exp: usize,             // Expiration time (as UTC timestamp)
+    aud: String,            // Audience
+    iat: usize,             // Issued at (as UTC timestamp)
+    iss: String,            // Issuer
 }
 
 fn keys_to_map(keys: Vec<JsonWebKey>) -> HashMap<String, JsonWebKey> {
@@ -93,4 +93,3 @@ impl JwkVerifier {
             .map_err(|_| VerificationError::InvalidSignature)
     }
 }
-

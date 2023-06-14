@@ -160,8 +160,10 @@ impl Plugin for JwtAuth {
                         msg: String,
                         status: StatusCode,
                     ) -> supergraph::Response {
+                        let mut error = graphql::Error::default();
+                        error.message = msg;
                         supergraph::Response::error_builder()
-                            .error(graphql::Error::builder().message(msg).build())
+                            .error(error)
                             .status_code(status)
                             .context(context)
                             .build()
@@ -378,13 +380,11 @@ impl Plugin for JwtAuth {
                                 Ok(ControlFlow::Continue(req))
                             }
                         }
-                        _ => {
-                            return Ok(ControlFlow::Break(failure_message(
-                                req.context,
-                                format!("could not extract results from payload: {}", payload),
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                            )))
-                        }
+                        _ => Ok(ControlFlow::Break(failure_message(
+                            req.context,
+                            format!("could not extract results from payload: {}", payload),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                        ))),
                     }
                 }
             })
@@ -476,7 +476,7 @@ mod tests {
         apollo_router::TestHarness::builder()
             .configuration_json(config)
             .unwrap()
-            .build()
+            .build_supergraph()
             .await
             .unwrap();
     }

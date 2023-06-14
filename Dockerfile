@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 rust:1.65 as build
+FROM --platform=linux/amd64 rust:1.70 as build
 
 ENV RUST_BACKTRACE=full
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
@@ -8,13 +8,18 @@ RUN USER=root cargo new --bin router
 
 WORKDIR /router
 
+# Update our build image and install required packages
+RUN apt-get update
+RUN apt-get -y install \
+    protobuf-compiler
+
 RUN rustup component add rustfmt
 
 # copy over your manifests
 COPY ./Cargo.toml ./Cargo.toml
 
 # this build step will cache your dependencies
-RUN cargo build --release --verbose
+RUN cargo build --release
 RUN rm src/*.rs
 
 # copy your source tree
@@ -22,7 +27,7 @@ COPY ./src ./src
 
 # build for release
 RUN rm ./target/release/deps/router*
-RUN cargo build --release --verbose
+RUN cargo build --release
 
 RUN mkdir -p /dist/config && mkdir -p /dist/schema
 
